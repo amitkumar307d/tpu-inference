@@ -116,13 +116,13 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
     _ml_utils._MODEL_ARCH_BY_HASH.clear()
     _try_load_model_cls.cache_clear()
 
-    # DeepseekV4MLA is a plain nn.Module instantiated directly in
+    # DeepseekV4ROCMAiterMLAAttention is instantiated directly in
     # amd/model.py (not CustomOp/register_oot hook).
     # Swap the class symbol for the TPU subclass before the
     # model is built.
     from tpu_inference.layers.vllm.custom_ops.deepseek_v4_attention import \
-        patch_deepseek_v4_mla_cls
-    patch_deepseek_v4_mla_cls()
+        patch_deepseek_v4_attention_cls
+    patch_deepseek_v4_attention_cls()
 
     # DeepSeek-V4 builds CUDA streams (``torch.cuda.Stream``) at construction
     # which is unavailable on TPU. Mock it to return None.

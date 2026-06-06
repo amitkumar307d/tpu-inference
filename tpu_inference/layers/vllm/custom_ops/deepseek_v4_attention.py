@@ -33,7 +33,7 @@ import torch.nn as nn
 from vllm.config import CacheConfig, VllmConfig
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.quantization import QuantizationConfig
-from vllm.models.deepseek_v4.attention import DeepseekV4MLA
+from vllm.models.deepseek_v4.attention import DeepseekV4Attention
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 
@@ -85,12 +85,12 @@ class VllmDeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             output: torch.Tensor,  # [T, num_heads, head_dim]
     ) -> None:
         logger.error(
-            "DeepseekV4MLA.forward is not implemented, just a pass-through for now"
+            "DeepseekV4Attention.forward is not implemented, just a pass-through for now"
         )
         return q
 
 
-class VllmDeepseekV4MLA(DeepseekV4MLA):
+class VllmDeepseekV4Attention(DeepseekV4Attention):
 
     def __init__(
         self,
@@ -139,18 +139,18 @@ class VllmDeepseekV4MLA(DeepseekV4MLA):
         llama_4_scaling: torch.Tensor | None = None,
     ) -> torch.Tensor:
         logger.error(
-            "VllmDeepseekV4MLA.forward is not implemented, just a pass-through for now"
+            "VllmDeepseekV4Attention.forward is not implemented, just a pass-through for now"
         )
         return hidden_states
 
 
-def patch_deepseek_v4_mla_cls() -> None:
-    """Rebind ``DeepseekV4MLA`` to the TPU subclass for DS V4 model module.
+def patch_deepseek_v4_attention_cls() -> None:
+    """Rebind ``DeepseekV4ROCMAiterMLAAttention`` to the TPU subclass for DS V4 model module.
 
     Must run after ``vllm.models.deepseek_v4.amd.model`` is imported (it holds
-    its own ``from ...attention import DeepseekV4MLA`` reference) and before the
+    its own ``from ...rocm import DeepseekV4ROCMAiterMLAAttention`` reference) and before the
     model is constructed.
     """
     import vllm.models.deepseek_v4.amd.model as ds_v4_amd_model
-    ds_v4_amd_model.DeepseekV4MLA = VllmDeepseekV4MLA
-    logger.info("Patched DeepseekV4MLA -> VllmDeepseekV4MLA for TPU.")
+    ds_v4_amd_model.DeepseekV4ROCMAiterMLAAttention = VllmDeepseekV4Attention
+    logger.info("Patched DeepseekV4ROCMAiterMLAAttention -> VllmDeepseekV4Attention for TPU.")

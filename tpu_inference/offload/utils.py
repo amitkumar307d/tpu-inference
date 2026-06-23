@@ -91,12 +91,13 @@ def jitted_insert_kv_cache_slices(
 
 @functools.partial(
     jax.jit,
-    static_argnames=['num_blocks'],
+    static_argnames=['num_blocks', 'is_heterogenous'],
     donate_argnames=('kv_caches', ),
 )
 def stack_kv_cache_cross_layers(
         kv_caches: List[jax.Array], block_ids: jax.Array,
-        num_blocks: int) -> Tuple[List[jax.Array], List[jax.Array]]:
+        num_blocks: int,
+        is_heterogenous: bool = False) -> Tuple[List[jax.Array], List[jax.Array]]:
     """
     This uses jax.tree.map to apply the operation across all layers.
     """
@@ -105,14 +106,34 @@ def stack_kv_cache_cross_layers(
         return layer_kv_cache.at[block_ids].get()
 
     gathered_kv_layers = jax.tree.map(_gather_blocks, kv_caches)
-    stacked_blocks = jnp.stack(gathered_kv_layers, axis=1)
 
-    # Split the stacked_blocks along axis=0 into individual blocks
-    # NOTE(jcgu): num_blocks == len(block_ids)
-    split_blocks = jnp.split(stacked_blocks,
-                             indices_or_sections=num_blocks,
-                             axis=0)
-    # split_blocks = jnp.array_split(stacked_blocks, num_blocks, axis=0)
+    if not is_heterogenous:
+        stacked_blocks = jnp.stack(gathered_kv_layers, axis=1)
+
+        # Split the stacked_blocks along axis=0 into individual blocks
+        # NOTE(jcgu): num_blocks == len(block_ids)
+        split_blocks = jnp.split(stacked_blocks,
+                                 indices_or_sections=num_blocks,
+                                 axis=0)
+    else:
+        # Group by shape to support heterogeneous layers (grouped stacking)
+        groups = {}
+        for layer in gathered_kv_layers:
+            shape = layer.shape
+            if shape not in groups:
+                groups[shape] = []
+            groups[shape].append(layer)
+
+        sorted_shapes = sorted(groups.keys())
+
+        split_groups = []
+        for shape in sorted_shapes:
+            stacked_group = jnp.stack(groups[shape], axis=1)
+            split_groups.append(jnp.split(stacked_group, indices_or_sections=num_blocks, axis=0))
+
+        # Zip across groups to create a list where each element represents one block.
+        # Each block element is a list of arrays (one array per shape group).
+        split_blocks = [list(block_group) for block_group in zip(*split_groups)]
 
     kv_caches = jax.lax.optimization_barrier(kv_caches)
 
@@ -166,6 +187,7 @@ def update_kv_caches_one(
     mesh: Mesh,
     cached_kv_sharding_spec: PartitionSpec | None = None,
     replicated_sharding: PartitionSpec | None = None,
+    is_heterogenous: bool = False,
 ) -> List[jax.Array]:
     """Update KV caches using cached sharding spec to avoid recompilation.
     
@@ -177,6 +199,7 @@ def update_kv_caches_one(
         cached_kv_sharding_spec: Pre-cached sharding spec from initialization.
                                  If None, derived from kv_caches[0].sharding.spec (fallback).
         replicated_sharding: PartitionSpec for replicated sharding
+        is_heterogenous: Flag indicating if layers have varying shapes
     """
     # Use cached spec if provided, otherwise fall back to extracting from input
     if cached_kv_sharding_spec is None:
@@ -194,7 +217,8 @@ def update_kv_caches_one(
         mesh,
         cached_kv_sharding_spec,
         cached_kv_sharding_spec,
-        replicated_sharding.spec,
+        replicated_sharding.spec if replicated_sharding else None,
+        is_heterogenous=is_heterogenous,
     )
 
 
@@ -224,7 +248,7 @@ def pre_update_kv_caches(
 @functools.partial(
     jax.jit,
     static_argnames=("mesh", "src_sharding_spec", "dest_sharding_spec",
-                     "replicated_sharding_spec"),
+                     "replicated_sharding_spec", "is_heterogenous"),
     donate_argnames=("kv_caches", ),
 )
 def update_kv_caches(kv_caches: List[jax.Array],
@@ -232,7 +256,8 @@ def update_kv_caches(kv_caches: List[jax.Array],
                      dest_offsets: jax.Array, chunk_sizes: jax.Array,
                      num_chunks: jax.Array, mesh, src_sharding_spec,
                      dest_sharding_spec,
-                     replicated_sharding_spec) -> List[jax.Array]:
+                     replicated_sharding_spec,
+                     is_heterogenous: bool = False) -> List[jax.Array]:
     """
     Updates KV caches by unstacking gathered blocks and copying slices.
 
@@ -247,13 +272,38 @@ def update_kv_caches(kv_caches: List[jax.Array],
       src_sharding_spec: PartitionSpec for source arrays.
       dest_sharding_spec: PartitionSpec for destination arrays.
       replicated_sharding_spec: PartitionSpec for replicated sharding.
+      is_heterogenous: Flag indicating if layers have varying shapes.
 
     Returns:
       List of updated KV caches for each layer.
     """
-    concatenated_blocks = jnp.concatenate(stacked_blocks, axis=0)
-    layer_slices_tuple = jnp.unstack(concatenated_blocks, axis=1)
-    layer_slices_list = list(layer_slices_tuple)
+    if not is_heterogenous:
+        concatenated_blocks = jnp.concatenate(stacked_blocks, axis=0)
+        layer_slices_tuple = jnp.unstack(concatenated_blocks, axis=1)
+        layer_slices_list = list(layer_slices_tuple)
+    else:
+        # Group kv_caches by shape to reconstruct the mapping
+        groups = {}
+        group_indices = {}
+        for i, cache in enumerate(kv_caches):
+            shape = cache.shape[1:]
+            if shape not in groups:
+                groups[shape] = []
+                group_indices[shape] = []
+            groups[shape].append(cache)
+            group_indices[shape].append(i)
+
+        sorted_shapes = sorted(groups.keys())
+
+        layer_slices_list = [None] * len(kv_caches)
+
+        for group_idx, shape in enumerate(sorted_shapes):
+            group_blocks = [block[group_idx] for block in stacked_blocks]
+            concatenated_group = jnp.concatenate(group_blocks, axis=0)
+            unstacked_group = jnp.unstack(concatenated_group, axis=1)
+
+            for orig_idx, slice_data in zip(group_indices[shape], unstacked_group):
+                layer_slices_list[orig_idx] = slice_data
 
     output = kv_transfer.multi_layer_copy(
         src_array=layer_slices_list,
@@ -271,12 +321,13 @@ def update_kv_caches(kv_caches: List[jax.Array],
 
 @functools.partial(
     jax.jit,
-    static_argnames=['num_blocks'],
+    static_argnames=['num_blocks', 'is_heterogenous'],
     donate_argnames=('kv_caches', ),
 )
 def pure_jax_stack_kv_cache_cross_layers(
         kv_caches: List[jax.Array], block_ids: jax.Array,
-        num_blocks: int) -> Tuple[List[jax.Array], List[jax.Array]]:
+        num_blocks: int,
+        is_heterogenous: bool = False) -> Tuple[List[jax.Array], List[jax.Array]]:
     """
     Gathers KV cache blocks across all layers for offloading, using pure JAX operations.
     
@@ -289,22 +340,43 @@ def pure_jax_stack_kv_cache_cross_layers(
         kv_caches: List of original KV caches for each layer.
         block_ids: Array of block indices to extract.
         num_blocks: Total number of blocks to gather (used for static dimensioning).
+        is_heterogenous: Flag indicating if layers have varying shapes.
 
     Returns:
         A tuple containing:
           - The original list of KV caches (passed through an optimization barrier).
-          - A list of extracted block tensors, each shaped (1, num_layers, ...).
+          - A list of extracted block tensors.
     """
 
     def _gather_blocks(layer_kv_cache):
         return layer_kv_cache.at[block_ids].get()
 
     gathered_kv_layers = jax.tree.map(_gather_blocks, kv_caches)
-    stacked_blocks = jnp.stack(gathered_kv_layers, axis=1)
 
-    split_blocks = jnp.split(stacked_blocks,
-                             indices_or_sections=num_blocks,
-                             axis=0)
+    if not is_heterogenous:
+        stacked_blocks = jnp.stack(gathered_kv_layers, axis=1)
+        split_blocks = jnp.split(stacked_blocks,
+                                 indices_or_sections=num_blocks,
+                                 axis=0)
+    else:
+        # Group by shape to support heterogeneous layers (grouped stacking)
+        groups = {}
+        for layer in gathered_kv_layers:
+            shape = layer.shape
+            if shape not in groups:
+                groups[shape] = []
+            groups[shape].append(layer)
+
+        sorted_shapes = sorted(groups.keys())
+
+        split_groups = []
+        for shape in sorted_shapes:
+            stacked_group = jnp.stack(groups[shape], axis=1)
+            split_groups.append(jnp.split(stacked_group, indices_or_sections=num_blocks, axis=0))
+
+        # Zip across groups to create a list where each element represents one block.
+        # Each block element is a list of arrays (one array per shape group).
+        split_blocks = [list(block_group) for block_group in zip(*split_groups)]
 
     kv_caches = jax.lax.optimization_barrier(kv_caches)
     return kv_caches, split_blocks
@@ -312,7 +384,7 @@ def pure_jax_stack_kv_cache_cross_layers(
 
 @functools.partial(
     jax.jit,
-    static_argnames=("mesh", "cached_kv_sharding_spec", "indices_sharding"),
+    static_argnames=("mesh", "cached_kv_sharding_spec", "indices_sharding", "is_heterogenous"),
     donate_argnames=("kv_caches", ),
 )
 def pure_jax_update_kv_caches_one(
@@ -322,6 +394,7 @@ def pure_jax_update_kv_caches_one(
     mesh: Mesh,
     cached_kv_sharding_spec: PartitionSpec | None = None,
     indices_sharding: PartitionSpec | None = None,
+    is_heterogenous: bool = False,
 ) -> List[jax.Array]:
     """
     Updates the physical KV cache by inserting stacked blocks into specified 
@@ -341,6 +414,7 @@ def pure_jax_update_kv_caches_one(
                                  impl, kept for signature compatibility).
         indices_sharding: Optional NamedSharding or PartitionSpec to place the indices 
                             array on the device mesh.
+        is_heterogenous: Flag indicating if layers have varying shapes.
 
     Returns:
         List of updated KV caches for each layer.
@@ -362,9 +436,33 @@ def pure_jax_update_kv_caches_one(
     indices_arr = jax.device_put(indices_arr, sharding)
     indices_arr = indices_arr[:, None]
 
-    concatenated_blocks = jnp.concatenate(stacked_blocks, axis=0)
-    layer_slices_tuple = jnp.unstack(concatenated_blocks, axis=1)
-    layer_slices_list = list(layer_slices_tuple)
+    if not is_heterogenous:
+        concatenated_blocks = jnp.concatenate(stacked_blocks, axis=0)
+        layer_slices_tuple = jnp.unstack(concatenated_blocks, axis=1)
+        layer_slices_list = list(layer_slices_tuple)
+    else:
+        # Group kv_caches by shape to reconstruct the mapping
+        groups = {}
+        group_indices = {}
+        for i, cache in enumerate(kv_caches):
+            shape = cache.shape[1:]
+            if shape not in groups:
+                groups[shape] = []
+                group_indices[shape] = []
+            groups[shape].append(cache)
+            group_indices[shape].append(i)
+
+        sorted_shapes = sorted(groups.keys())
+
+        layer_slices_list = [None] * len(kv_caches)
+
+        for group_idx, shape in enumerate(sorted_shapes):
+            group_blocks = [block[group_idx] for block in stacked_blocks]
+            concatenated_group = jnp.concatenate(group_blocks, axis=0)
+            unstacked_group = jnp.unstack(concatenated_group, axis=1)
+
+            for orig_idx, slice_data in zip(group_indices[shape], unstacked_group):
+                layer_slices_list[orig_idx] = slice_data
 
     def _update_layer(cache_layer, slices):
         dim_nums = jax.lax.ScatterDimensionNumbers(

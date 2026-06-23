@@ -1356,6 +1356,9 @@ class TPUOffloadConnectorWorker:
             self.device_sharding = kv_layer.sharding
             self.num_kv_blocks = self.shape[0]
 
+            shapes = [c.shape for c in kv_caches]
+            self.is_heterogenous = len(set(shapes)) > 1
+
             # Cache the kv sharding spec at initialization
             # to prevent recompilation. This avoids deriving
             # kv_caches[0].sharding.spec in update_kv_caches_one at runtime,
@@ -1450,10 +1453,10 @@ class TPUOffloadConnectorWorker:
     def _do_stack(self, kv_caches, block_ids_arr, num_blocks):
         if self.mesh.shape.get('attn_dp', 1) > 1:
             return pure_jax_stack_kv_cache_cross_layers(
-                kv_caches, block_ids_arr, num_blocks)
+                kv_caches, block_ids_arr, num_blocks, is_heterogenous=self.is_heterogenous)
         else:
             return stack_kv_cache_cross_layers(kv_caches, block_ids_arr,
-                                               num_blocks)
+                                               num_blocks, is_heterogenous=self.is_heterogenous)
 
     def _do_update(self, kv_caches, kv_cache_slices, dst_blocks, mesh,
                    cached_kv_sharding_spec, indices_sharding):
@@ -1461,11 +1464,13 @@ class TPUOffloadConnectorWorker:
             return pure_jax_update_kv_caches_one(kv_caches, kv_cache_slices,
                                                  dst_blocks, mesh,
                                                  cached_kv_sharding_spec,
-                                                 indices_sharding)
+                                                 indices_sharding,
+                                                 is_heterogenous=self.is_heterogenous)
         else:
             return update_kv_caches_one(kv_caches, kv_cache_slices, dst_blocks,
                                         mesh, cached_kv_sharding_spec,
-                                        indices_sharding)
+                                        indices_sharding,
+                                        is_heterogenous=self.is_heterogenous)
 
     def _precompile_kv_swap_operations(self):
         """
